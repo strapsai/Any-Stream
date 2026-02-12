@@ -1,7 +1,8 @@
-faiss-gpu
+faiss-cpu
 pandas
 prettytable
 einops
 safetensors
 numba
 pypose
+rerun-sdk

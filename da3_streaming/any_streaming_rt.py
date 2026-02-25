@@ -41,6 +41,7 @@ from loop_utils.sim3utils import (
 
 from safetensors.torch import load_file
 from depth_anything_3.api import DepthAnything3
+from viz_ply_cas import read_gps_csv, build_enu_interpolator, extract_ts_ns, umeyama_alignment
 
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
     """
@@ -102,7 +103,7 @@ def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
 
 
 class Any_StreamingRT:
-    def __init__(self, image_dir, save_dir, config):
+    def __init__(self, image_dir, save_dir, config, gps_csv=None):
         self.config = config
 
         self.chunk_size = self.config["Model"]["chunk_size"]
@@ -139,6 +140,17 @@ class Any_StreamingRT:
         self.prev_predictions = None
         self.chunk_indices: list = []
         self._rr_time = 0
+
+        # GPS alignment state
+        self.gps_csv = gps_csv
+        self.gps_interp = None
+        self.gps_meta = None
+        if gps_csv is not None:
+            gps_rows = read_gps_csv(gps_csv)
+            self.gps_interp, self.gps_meta = build_enu_interpolator(gps_rows)
+            print(f"GPS loaded: {len(gps_rows)} samples")
+        self.acc_cam_positions: list = []   # list of [K,3] arrays, non-overlap camera positions
+        self.frame_image_paths: list = []   # parallel to acc_cam_positions (flattened)
 
         if model_type == "DA3":
             with open(self.config["Weights"]["DA3_CONFIG"]) as f:
@@ -280,15 +292,25 @@ class Any_StreamingRT:
         return filter_mask  # [N, H, W] bool
 
     
-    def _extract_new_points(self, predictions, chunk_idx: int, s_abs, R_abs, t_abs):
+    @staticmethod
+    def _w2c_to_camera_positions(extrinsics_w2c: np.ndarray) -> np.ndarray:
+        """Convert W2C extrinsics [N, 3, 4] to camera positions [N, 3] in world frame."""
+        N = extrinsics_w2c.shape[0]
+        w2c_4x4 = np.zeros((N, 4, 4), dtype=np.float32)
+        w2c_4x4[:, :3, :4] = extrinsics_w2c
+        w2c_4x4[:, 3, 3] = 1.0
+        c2w = np.linalg.inv(w2c_4x4)
+        return c2w[:, :3, 3]
+
+    def _extract_new_points(self, predictions, chunk_idx: int, s_abs, R_abs, t_abs,
+                            chunk_paths: list = None):
         """
         Extract world-space points for the non-overlap frames of this chunk,
         apply cumulative SIM(3), filter (mask and/or conf), and subsample.
-        Returns (pts [M,3] float32, cols [M,3] uint8).
+        Returns (pts [M,3], cols [M,3], cam_pos [K,3], frame_paths [K]).
         """
         n = len(predictions.depth)
         ov = self.overlap
-        n_chunks = len(self.chunk_indices)
 
         if chunk_idx == 0:
             sl = slice(0, n - ov)
@@ -299,8 +321,11 @@ class Any_StreamingRT:
         images = predictions.processed_images[sl]
 
         if len(depth) == 0:
-            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
-        
+            empty_pts = np.zeros((0, 3), dtype=np.float32)
+            empty_cols = np.zeros((0, 3), dtype=np.uint8)
+            empty_cam = np.zeros((0, 3), dtype=np.float32)
+            return empty_pts, empty_cols, empty_cam, []
+
         # Get world points — use model's own if available, else backproject
         if getattr(predictions, 'world_points', None) is not None:
             pts = predictions.world_points[sl]  # [N, H, W, 3]
@@ -309,9 +334,22 @@ class Any_StreamingRT:
             E = predictions.extrinsics[sl]
             pts = depth_to_point_cloud_vectorized(depth, K, E)  # [N, H, W, 3]
 
+        # Extract camera positions for non-overlap frames
+        cam_pos = self._w2c_to_camera_positions(predictions.extrinsics[sl])  # [K, 3]
+
         # Apply cumulative SIM(3) for all chunks after the first
         if chunk_idx > 0:
             pts = apply_sim3_direct_torch(pts, s_abs, R_abs, t_abs)  # [N, H, W, 3] numpy
+            cam_pos = (s_abs * (cam_pos @ R_abs.T) + t_abs).astype(np.float32)
+
+        # Non-overlap frame paths
+        if chunk_paths is not None:
+            if chunk_idx == 0:
+                frame_paths = chunk_paths[:n - ov]
+            else:
+                frame_paths = chunk_paths[ov:]
+        else:
+            frame_paths = []
 
         # Build filter mask (handles mask vs conf logic)
         filter_mask = self._build_filter_mask(predictions, sl)  # [N, H, W] bool
@@ -331,7 +369,7 @@ class Any_StreamingRT:
             pts_valid  = pts_valid[idx]
             cols_valid = cols_valid[idx]
 
-        return pts_valid, cols_valid
+        return pts_valid, cols_valid, cam_pos, frame_paths
     
     def _log_to_rerun(self):
         if not self.acc_pts:
@@ -351,6 +389,90 @@ class Any_StreamingRT:
         rr.log("map/pointcloud", rr.Points3D(positions=all_pts, colors=all_cols))
         print(f"  [rerun] {len(all_pts):,} pts logged  "
               f"(total acc: {sum(len(p) for p in self.acc_pts):,})")
+
+    def _compute_gps_alignment(self):
+        """
+        Compute Umeyama alignment from accumulated local camera positions to GPS ENU.
+        Returns (s, R, t, local_matched, gps_matched) or None.
+        """
+        if self.gps_interp is None or not self.acc_cam_positions:
+            return None
+
+        all_cam_pos = np.concatenate(self.acc_cam_positions, axis=0)
+
+        local_matched = []
+        gps_matched = []
+        for i, path in enumerate(self.frame_image_paths):
+            ts = extract_ts_ns(path)
+            if ts is None:
+                continue
+            e, n, u = self.gps_interp(ts)
+            if np.isfinite(e) and np.isfinite(n) and np.isfinite(u):
+                local_matched.append(all_cam_pos[i])
+                gps_matched.append([float(e), float(n), float(u)])
+
+        if len(local_matched) < 3:
+            print(f"  [GPS] Only {len(local_matched)} matches, need >= 3. Skipping.")
+            return None
+
+        local_matched = np.array(local_matched, dtype=np.float64)
+        gps_matched = np.array(gps_matched, dtype=np.float64)
+
+        s, R, t = umeyama_alignment(local_matched, gps_matched, with_scale=True)
+
+        aligned = s * (local_matched @ R.T) + t
+        rmse = np.sqrt(np.mean(np.sum((aligned - gps_matched) ** 2, axis=1)))
+        print(f"  [GPS] Umeyama: s={s:.4f}, RMSE={rmse:.3f}m, {len(local_matched)} matches")
+
+        return s, R, t, local_matched, gps_matched
+
+    def _apply_gps_transform(self, s_gps, R_gps, t_gps):
+        """Apply GPS SIM(3) to all accumulated points. Returns (global_pts, global_cols)."""
+        if not self.acc_pts:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+        all_pts = np.concatenate(self.acc_pts, axis=0)
+        all_cols = np.concatenate(self.acc_cols, axis=0)
+        global_pts = (s_gps * (all_pts.astype(np.float64) @ R_gps.T) + t_gps).astype(np.float32)
+        return global_pts, all_cols
+
+    def _log_to_rerun_gps(self, s_gps, R_gps, t_gps, gps_matched):
+        """Log GPS-aligned point cloud and trajectories to Rerun."""
+        global_pts, global_cols = self._apply_gps_transform(s_gps, R_gps, t_gps)
+
+        max_pts = 3_000_000
+        if len(global_pts) > max_pts:
+            idx = np.random.choice(len(global_pts), size=max_pts, replace=False)
+            global_pts = global_pts[idx]
+            global_cols = global_cols[idx]
+
+        rr.set_time("stable_time", sequence=self._rr_time - 1)  # same timestep as local log
+        rr.log("map/global_pointcloud", rr.Points3D(positions=global_pts, colors=global_cols))
+
+        # Predicted trajectory in GPS frame (blue)
+        all_cam = np.concatenate(self.acc_cam_positions, axis=0)
+        cam_global = (s_gps * (all_cam.astype(np.float64) @ R_gps.T) + t_gps).astype(np.float32)
+        rr.log("map/trajectory_pred", rr.Points3D(
+            positions=cam_global,
+            colors=np.full((len(cam_global), 3), [0, 0, 255], dtype=np.uint8),
+        ))
+        if len(cam_global) >= 2:
+            rr.log("map/trajectory_pred_line", rr.LineStrips3D(
+                [cam_global], colors=[[0, 0, 255]],
+            ))
+
+        # GPS ground truth (green)
+        gps_f32 = gps_matched.astype(np.float32)
+        rr.log("map/trajectory_gps", rr.Points3D(
+            positions=gps_f32,
+            colors=np.full((len(gps_f32), 3), [0, 255, 0], dtype=np.uint8),
+        ))
+        if len(gps_f32) >= 2:
+            rr.log("map/trajectory_gps_line", rr.LineStrips3D(
+                [gps_f32], colors=[[0, 255, 0]],
+            ))
+
+        print(f"  [rerun/gps] {len(global_pts):,} pts, "
+              f"{len(cam_global)} pred poses, {len(gps_f32)} gps poses")
 
     def run(self):
         print(f"Loading images from {self.img_dir}...")
@@ -395,12 +517,23 @@ class Any_StreamingRT:
                 cumulative = accumulate_sim3_transforms(self.sim3_list)
                 s_abs, R_abs, t_abs = cumulative[-1]
 
-            pts, cols = self._extract_new_points(cur_pred, chunk_idx, s_abs, R_abs, t_abs)
+            pts, cols, cam_pos, frame_paths = self._extract_new_points(
+                cur_pred, chunk_idx, s_abs, R_abs, t_abs, chunk_paths
+            )
             if len(pts) > 0:
                 self.acc_pts.append(pts)
                 self.acc_cols.append(cols)
+            self.acc_cam_positions.append(cam_pos)
+            self.frame_image_paths.extend(frame_paths)
 
             self._log_to_rerun()
+
+            # GPS alignment (optional)
+            gps_result = self._compute_gps_alignment()
+            if gps_result is not None:
+                s_gps, R_gps, t_gps, local_matched, gps_matched = gps_result
+                self._log_to_rerun_gps(s_gps, R_gps, t_gps, gps_matched)
+
             self.prev_predictions = cur_pred
 
         total_time = time.time() - self.start_time
@@ -435,6 +568,49 @@ class Any_StreamingRT:
             ) #TODO: Check if worth adding unfiltered map
             print(f"Saved final map → {ply_path}  ({len(all_pts):,} pts)")
 
+        # Save GPS-aligned outputs
+        gps_result = self._compute_gps_alignment()
+        if gps_result is not None:
+            s_gps, R_gps, t_gps, local_matched, gps_matched = gps_result
+            global_pts, global_cols = self._apply_gps_transform(s_gps, R_gps, t_gps)
+
+            ply_global = os.path.join(self.output_dir, "final_map_global.ply")
+            save_confident_pointcloud_batch(
+                points=global_pts, colors=global_cols,
+                confs=np.ones(len(global_pts), dtype=np.float32),
+                output_path=ply_global, conf_threshold=0.0, sample_ratio=1.0,
+            )
+            print(f"Saved GPS-aligned map → {ply_global}  ({len(global_pts):,} pts)")
+
+            # Save per-frame poses: predicted (GPS frame) vs GPS ground truth
+            poses_path = os.path.join(self.output_dir, "poses_global.txt")
+            all_cam = np.concatenate(self.acc_cam_positions, axis=0)
+            cam_global = s_gps * (all_cam.astype(np.float64) @ R_gps.T) + t_gps
+            with open(poses_path, "w") as f:
+                f.write("# image  pred_e pred_n pred_u  gps_e gps_n gps_u\n")
+                for i, path in enumerate(self.frame_image_paths):
+                    ts = extract_ts_ns(path)
+                    if ts is not None and self.gps_interp is not None:
+                        e, n, u = self.gps_interp(ts)
+                    else:
+                        e, n, u = np.nan, np.nan, np.nan
+                    f.write(f"{os.path.basename(path)}  "
+                            f"{cam_global[i,0]:.4f} {cam_global[i,1]:.4f} {cam_global[i,2]:.4f}  "
+                            f"{float(e):.4f} {float(n):.4f} {float(u):.4f}\n")
+            print(f"Saved GPS-aligned poses → {poses_path}")
+
+            # Save alignment transform
+            transform_path = os.path.join(self.output_dir, "gps_alignment.txt")
+            aligned = s_gps * (local_matched @ R_gps.T) + t_gps
+            rmse = np.sqrt(np.mean(np.sum((aligned - gps_matched) ** 2, axis=1)))
+            with open(transform_path, "w") as f:
+                f.write(f"scale: {s_gps}\n")
+                f.write(f"rotation:\n{R_gps}\n")
+                f.write(f"translation: {t_gps}\n")
+                f.write(f"rmse: {rmse:.4f}\n")
+                f.write(f"n_matches: {len(local_matched)}\n")
+            print(f"Saved GPS alignment info → {transform_path}")
+
         print("Done.")
 
 if __name__ == "__main__":
@@ -442,6 +618,8 @@ if __name__ == "__main__":
     parser.add_argument("--image_dir",  type=str, required=True)
     parser.add_argument("--config",     type=str, default="./configs/base_config.yaml")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--gps_csv",    type=str, default=None,
+                        help="Path to GPS CSV file for global alignment (optional)")
     rr.script_add_args(parser)  # adds --rr-addr, --save etc; must be called before parse_args
     args = parser.parse_args()
 
@@ -462,7 +640,7 @@ if __name__ == "__main__":
     if config["Model"]["align_lib"] == "numba":
         warmup_numba()
 
-    streamer = Any_StreamingRT(args.image_dir, args.output_dir, config)
+    streamer = Any_StreamingRT(args.image_dir, args.output_dir, config, gps_csv=args.gps_csv)
     streamer.run()
 
     del streamer

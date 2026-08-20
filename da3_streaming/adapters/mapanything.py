@@ -10,31 +10,67 @@ class MapAnythingAdapter:
     Converts MapAnything outputs to the unified Predictions format.
     """
 
-    def __init__(self, device: str = "cuda"):
+    def __init__(self, device: str = "cuda", checkpoint_path: str = None):
         self.device = device
         self.model = None
+        self.checkpoint_path = checkpoint_path
         self._k_prior_logged = False
 
     def load(self):
-        """Load MapAnything model."""
+        """Load MapAnything from a local directory or the HF hub.
+
+        PyTorchModelHubMixin.from_pretrained accepts either, so checkpoint_path
+        can be a directory holding config.json + model.safetensors. Prefer that
+        on deployment: the hub route needs network access at model-load time.
+        """
         from mapanything.models import MapAnything
-        
-        self.model = MapAnything.from_pretrained("facebook/map-anything")
+
+        source = self.checkpoint_path or "facebook/map-anything"
+        self.model = MapAnything.from_pretrained(source)
         self.model = self.model.to(self.device)
         self.model.eval()
-        print("MapAnything model loaded.")
+        print(f"MapAnything model loaded from {source}.")
 
-    
+    def _scaled_K(self, intrinsics, ref_image_path, views):
+        """K for the on-disk images, mapped to the resolution load_images() produced.
+
+        load_images() runs crop_resize_if_necessary(), and
+        preprocess_input_views_for_inference() then builds the rays from the
+        RESIZED shape -- it never rescales intrinsics. A K left at the on-disk
+        resolution therefore describes a different image than the one being
+        encoded: no error, just quietly wrong geometry.
+
+        Reuses MapAnything's own crop_resize_if_necessary() rather than scaling by
+        hand: the resize is isotropic plus a crop, so a per-axis scale gets fx/fy
+        and the principal point wrong (~9 px on this data).
+        """
+        from PIL import Image
+        from mapanything.utils.cropping import crop_resize_if_necessary
+
+        Hp, Wp = views[0]["img"].shape[-2:]
+        img = Image.open(ref_image_path)
+        Wo, Ho = img.size
+
+        K_in = np.asarray(intrinsics, dtype=np.float64)
+        # returns (image, intrinsics) when only intrinsics is passed alongside
+        K_out = np.asarray(crop_resize_if_necessary(
+            image=img, resolution=(Wp, Hp), intrinsics=K_in)[1])
+
+        if not self._k_prior_logged:
+            print(f"[MapAnythingAdapter] intrinsics prior: on-disk {Wo}x{Ho} -> "
+                  f"model {Wp}x{Hp}\n  effective K:\n{K_out}")
+            self._k_prior_logged = True
+        return torch.as_tensor(K_out, dtype=torch.float32)
+
     def infer(self, image_paths: List[str], intrinsics=None) -> Predictions:
         """
         Run inference and return unified Predictions object.
 
         Args:
             image_paths: List of paths to images
-            intrinsics: Optional 3x3 K (numpy or torch) at the original image
-                resolution. When provided, attached to every view as a prior;
-                preprocess_inputs() (mapanything.utils.image) rescales it to
-                the patch-aligned tensor automatically.
+            intrinsics: Optional 3x3 K (numpy or torch) for the images ON DISK.
+                Rescaled here to the resolution load_images() resized them to,
+                then attached to every view as a prior.
 
         Returns:
             Predictions object with W2C extrinsics
@@ -46,12 +82,14 @@ class MapAnythingAdapter:
         print(f"Loaded {len(views)} views")
 
         if intrinsics is not None:
-            K_t = torch.as_tensor(intrinsics, dtype=torch.float32)
-            if not self._k_prior_logged:
-                print(f"[MapAnythingAdapter] attaching intrinsics prior:\n{K_t.numpy()}")
-                self._k_prior_logged = True
+            # Every frame in a chunk shares a resolution and target, so map K once.
+            K_model = self._scaled_K(intrinsics, image_paths[0], views)
             for v in views:
-                v["intrinsics"] = K_t
+                # (1, 3, 3), not (3, 3): get_rays_in_camera_frame() mirrors the
+                # batching of its input, and every other field in the view carries
+                # B=1. An unbatched K yields (H, W, 3) rays, which the model then
+                # fails to index with its per-sample mask of shape (1,).
+                v["intrinsics"] = K_model[None]
 
         # 2. Run inference
         with torch.no_grad():

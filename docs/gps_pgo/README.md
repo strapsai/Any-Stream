@@ -30,7 +30,7 @@ the corrected graph and its numerical output are unchanged.
 [starling_example.yaml](starling_example.yaml) is an ablation configuration fragment
 for the 787-frame Starling flight investigated in September 2026. Merge its keys
 into an existing model configuration. It is not a complete launch configuration or
-a generally calibrated default. See the experiment report for quality tradeoffs.
+a generally calibrated default. See [the investigation handoff](investigation.md) for quality tradeoffs.
 
 Run the synthetic graph tests in an environment with the project's existing
 requirements (including GTSAM 4.3a1):

@@ -93,7 +93,7 @@ class Sim3GPSFactor(_CustomFactorBase):
 
     Residual layout (5-vec):
         r[0:2] = Unit3(R_k @ v_loc).localCoordinates(Unit3(v_gps))    # heading (on S^2)
-        r[2:5] = s_k * (R_k @ c_loc) + t_k - p_obs                    # position (metric)
+        r[2:5] = X_k.transformFrom(c_loc) - p_obs                    # position (metric)
 
     Jacobian is numerical (central differences on the 7-DOF Sim3 tangent
     [omega(3), v(3), sigma(1)]).
@@ -117,10 +117,8 @@ class Sim3GPSFactor(_CustomFactorBase):
         super().__init__(noise_model, [key], self._error_func)
 
     def _residual(self, X):
-        s = X.scale()
         R = X.rotation().matrix()
-        t = np.asarray(X.translation()).reshape(3)
-        r_pos = s * (R @ self._c_loc) + t - self._p_obs
+        r_pos = X.transformFrom(self._c_loc) - self._p_obs
         v_pred_world = R @ self._v_loc
         if np.linalg.norm(v_pred_world) < 1e-12:
             r_head = np.zeros(2)
@@ -187,6 +185,19 @@ class Sim3LoopOptimizer:
         s = data[7]
         R_mat = R.from_quat(q).as_matrix()
         return s, R_mat, t
+
+    @staticmethod
+    def _gtsam_sim3_from_srt(s, R_mat, t_vec):
+        """Encode mapper action s * R @ p + t in GTSAM's s * (R @ p + t)."""
+        return gtsam.Similarity3(
+            gtsam.Rot3(R_mat), np.asarray(t_vec, dtype=np.float64).reshape(3) / s, s
+        )
+
+    @staticmethod
+    def _srt_from_gtsam_sim3(sim3):
+        """Return the mapper's metric translation, outside the scale operation."""
+        s = float(sim3.scale())
+        return s, sim3.rotation().matrix(), s * np.asarray(sim3.translation()).reshape(3)
 
     @staticmethod
     def _gtsam_pose3_from_rt(R_mat, t_vec):
@@ -658,7 +669,8 @@ class Sim3LoopOptimizer:
         GPS frame. The optimized s_k stretches the chunk interior uniformly about
         its anchor.
 
-        Returns per-chunk absolute GPS-frame Sim3 tuples (s_k, R_k, t_k).
+        Returns mapper tuples (s_k, R_k, t_k), acting as s_k * R_k @ p + t_k.
+        GTSAM stores translation inside scale; convert at both API boundaries.
         """
         _require_gtsam_sim3("optimize_gps_sim3")
 
@@ -722,7 +734,7 @@ class Sim3LoopOptimizer:
                 t_k = p_obs_rep - s_k * (R_k @ c_loc_rep)
             else:
                 t_k = s_g * (R_g @ t_m) + t_g
-            init_sim3.append(gtsam.Similarity3(gtsam.Rot3(R_k), gtsam.Point3(*t_k), s_k))
+            init_sim3.append(self._gtsam_sim3_from_srt(s_k, R_k, t_k))
 
         graph = gtsam.NonlinearFactorGraph()
         initial = gtsam.Values()
@@ -800,11 +812,7 @@ class Sim3LoopOptimizer:
         
         out = []
         for k in range(n_chunks):
-            Xk = result.atSimilarity3(X(k))
-            s_k = float(Xk.scale())
-            R_k = Xk.rotation().matrix()
-            t_k = np.asarray(Xk.translation()).reshape(3)
-            out.append((s_k, R_k, t_k))
+            out.append(self._srt_from_gtsam_sim3(result.atSimilarity3(X(k))))
         return out
 
 # ======== TEST CODE ========

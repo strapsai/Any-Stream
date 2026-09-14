@@ -695,7 +695,17 @@ class Sim3LoopOptimizer:
         seq_sigma_t = float(cfg.get("seq_sigma_t", seq_sigma))
         seq_sigma_scale = float(cfg.get("scale_bw_sigma", 0.05))
         scale_prior_sigma = float(cfg.get("scale_prior_sigma", 0.0))  # 0 = disabled
-        # TODO: write out details of these params.
+        # Legacy seq_sigma_t is in destination-chunk units. The metric option
+        # uses the INITIAL destination scale; it is approximate if scale changes.
+        seq_sigma_t_m = cfg.get("seq_sigma_t_m")
+        if seq_sigma_t_m is not None:
+            seq_sigma_t_m = float(seq_sigma_t_m)
+            if not np.isfinite(seq_sigma_t_m) or seq_sigma_t_m <= 0.0:
+                raise ValueError("seq_sigma_t_m must be finite and positive")
+        chunk_scale_sigma = float(cfg.get("per_chunk_scale_prior_sigma", 0.0))
+        if not np.isfinite(chunk_scale_sigma) or chunk_scale_sigma < 0.0:
+            raise ValueError("per_chunk_scale_prior_sigma must be finite and nonnegative")
+        normalize_gps = bool(cfg.get("gps_chunk_information_normalization", False))
 
         s_g, R_g, t_g = umeyama
         abs_poses_model = self.sequential_to_absolute_poses(sequential_transforms)
@@ -742,6 +752,20 @@ class Sim3LoopOptimizer:
         for k in range(n_chunks):
             initial.insert(X(k), init_sim3[k])
 
+        # Downweight repeated, correlated fixes without changing default behavior.
+        # Count only observations accepted by the factor eligibility checks below.
+        gps_counts = {}
+        if normalize_gps:
+            for m in gps_measurements:
+                k = int(m["chunk_k"])
+                if not (0 <= k < n_chunks):
+                    continue
+                finite = all(np.all(np.isfinite(m[field]))
+                             for field in ("p_obs", "v_obs", "c_loc", "v_loc"))
+                if (finite and np.linalg.norm(m["v_obs"]) >= 1e-8
+                        and np.linalg.norm(m["v_loc"]) >= 1e-8):
+                    gps_counts[k] = gps_counts.get(k, 0) + 1
+
         # 5-DOF GPS Factors
         n_gps_factors = 0
         for m in gps_measurements:
@@ -769,6 +793,8 @@ class Sim3LoopOptimizer:
                 if cov3[2, 2] < 1e-9:
                     cov3[2, 2] = 100.0 * max(cov3[0, 0], cov3[1, 1], 1e-6)
                 cov5[2:5, 2:5] = cov3 + 1e-9 * np.eye(3)
+            if normalize_gps:
+                cov5 *= gps_counts[k]
             noise = gtsam.noiseModel.Gaussian.Covariance(cov5)
             #TODO: check if the noise model is sensible.
 
@@ -791,7 +817,20 @@ class Sim3LoopOptimizer:
                 *self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k + 1]))
             )
             rel = visual_i.between(visual_j)
-            graph.add(gtsam.BetweenFactorSimilarity3(X(k), X(k + 1), rel, between_noise))
+            edge_noise = between_noise
+            if seq_sigma_t_m is not None:
+                edge_sigmas = between_sigmas.copy()
+                edge_sigmas[3:6] = seq_sigma_t_m / float(init_sim3[k + 1].scale())
+                edge_noise = gtsam.noiseModel.Diagonal.Sigmas(edge_sigmas)
+            graph.add(gtsam.BetweenFactorSimilarity3(X(k), X(k + 1), rel, edge_noise))
+
+        if chunk_scale_sigma > 0.0:
+            # Approximately fix each initial log-scale, with very weak pose priors.
+            scale_noise = gtsam.noiseModel.Diagonal.Sigmas(
+                np.array([1e6] * 6 + [chunk_scale_sigma], dtype=np.float64)
+            )
+            for k in range(n_chunks):
+                graph.addPriorSimilarity3(X(k), init_sim3[k], scale_noise)
 
         # optional weak global-scale prior on chunk 0
         if scale_prior_sigma > 0.0:
@@ -813,7 +852,9 @@ class Sim3LoopOptimizer:
         print(f"  [GPS-PGO-Sim3] {n_gps_factors} GPS factors, {n_chunks - 1} between factors")
         print(f"  [GPS-PGO-Sim3] init={init_method}  "
               f"sigmas: head={heading_sigma}  gps_t={gps_sigma_t}  "
-              f"seq_R={seq_sigma_R}  seq_t={seq_sigma_t}  seq_s={seq_sigma_scale}")
+              f"seq_R={seq_sigma_R}  seq_t_local={seq_sigma_t}  seq_s={seq_sigma_scale}  "
+              f"seq_t_m={seq_sigma_t_m}  gps_grouped={normalize_gps}  "
+              f"per_chunk_scale_prior={chunk_scale_sigma}")
         print(f"  [GPS-PGO-Sim3] LM: initial error={initial_error:.6f}  "
               f"final error={final_error:.6f}  iterations={iterations}")
         

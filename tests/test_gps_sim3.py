@@ -113,5 +113,83 @@ class VisualMeasurementTests(unittest.TestCase):
                     transform(points, expected), atol=1e-7)
 
 
+class MetricWeightTests(unittest.TestCase):
+    def test_between_translation_units(self):
+        rng = np.random.default_rng(31)
+        encode = Sim3LoopOptimizer._gtsam_sim3_from_srt
+        for _ in range(50):
+            s, u = rng.uniform(.2, 80, 2)
+            R, Q = Rotation.random(2, random_state=rng).as_matrix()
+            t, v = rng.normal(size=(2, 3)) * 20
+            delta = rng.normal(size=3) * .3
+            A, B, C = encode(s, R, t), encode(u, Q, v), encode(u, Q, v + delta)
+            error = gtsam.Similarity3.Logmap(A.between(B).between(A.between(C)))
+            np.testing.assert_allclose(error[:3], 0., atol=1e-9)
+            self.assertAlmostEqual(error[6], 0.)
+            self.assertAlmostEqual(np.linalg.norm(error[3:6]) * u, np.linalg.norm(delta))
+
+    def test_metric_sigmas_and_scale_priors(self):
+        result = capture_graph(*fixture(seq_sigma_t_m=.1, per_chunk_scale_prior_sigma=1e-5))
+        graph = result["graph"]
+        edges = [graph.at(i) for i in range(graph.size())
+                 if isinstance(graph.at(i), gtsam.BetweenFactorSimilarity3)]
+        for k, edge in enumerate(edges):
+            destination = result["initial"].atSimilarity3(gtsam.symbol("x", k + 1))
+            np.testing.assert_allclose(edge.noiseModel().sigmas()[3:6], .1 / destination.scale())
+        priors = [graph.at(i) for i in range(graph.size())
+                  if isinstance(graph.at(i), gtsam.PriorFactorSimilarity3)]
+        self.assertEqual(len(priors), 3)
+        for prior in priors:
+            self.assertAlmostEqual(prior.noiseModel().sigmas()[-1], 1e-5)
+
+    def test_grouping_counts_only_accepted_factors(self):
+        args = list(fixture(gps_chunk_information_normalization=True))
+        valid = args[2]
+        from copy import deepcopy
+        bad = deepcopy(valid[-1])
+        bad["v_obs"] = np.zeros(3)
+        invalid = deepcopy(valid[-1])
+        invalid["c_loc"][0] = np.nan
+        outside = deepcopy(valid[-1])
+        outside["chunk_k"] = 99
+        args[2] = valid + [bad, invalid, outside, {"chunk_k": 99}]
+        grouped = capture_graph(*args)["graph"]
+        plain = capture_graph(*fixture())["graph"]
+        self.assertEqual(grouped.size(), plain.size())
+        for i, measurement in enumerate(valid):
+            np.testing.assert_allclose(grouped.at(i).noiseModel().covariance(),
+                                       plain.at(i).noiseModel().covariance()
+                                       * (measurement["chunk_k"] + 1))
+
+    def test_disabled_controls_preserve_graph(self):
+        original = capture_graph(*fixture())["graph"]
+        disabled = capture_graph(*fixture(gps_chunk_information_normalization=False,
+                                          per_chunk_scale_prior_sigma=0.))["graph"]
+        # CustomFactor equality also compares Python callback identity. Compare
+        # actual factor residuals and covariance at perturbed poses instead.
+        self.assertEqual(original.size(), disabled.size())
+        rng = np.random.default_rng(10)
+        for _ in range(10):
+            values = gtsam.Values()
+            for k in range(3):
+                pose = Sim3LoopOptimizer._gtsam_sim3_from_srt(
+                    2., np.eye(3), rng.normal(size=3))
+                values.insert(gtsam.symbol("x", k), pose)
+            for i in range(original.size()):
+                a, b = original.at(i), disabled.at(i)
+                self.assertEqual(list(a.keys()), list(b.keys()))
+                np.testing.assert_array_equal(a.noiseModel().covariance(),
+                                              b.noiseModel().covariance())
+                np.testing.assert_array_equal(a.unwhitenedError(values),
+                                              b.unwhitenedError(values))
+
+    def test_invalid_sigmas_fail_early(self):
+        for options in [dict(seq_sigma_t_m=0.), dict(seq_sigma_t_m=-1.),
+                        dict(seq_sigma_t_m=float("nan")),
+                        dict(per_chunk_scale_prior_sigma=-1.)]:
+            with self.assertRaises(ValueError):
+                capture_graph(*fixture(**options))
+
+
 if __name__ == "__main__":
     unittest.main()

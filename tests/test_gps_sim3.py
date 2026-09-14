@@ -90,5 +90,28 @@ class SimilarityConventionTests(unittest.TestCase):
                                        transform(transform(points, model), alignment), atol=1e-8)
 
 
+class VisualMeasurementTests(unittest.TestCase):
+    def test_edges_do_not_follow_gps_anchoring(self):
+        graphs = []
+        for method in ["umeyama", "anchored"]:
+            args = fixture(init_method=method)
+            graphs.append(capture_graph(*args))
+        # Anchoring really changed the guess; the test is not vacuous.
+        self.assertGreater(np.linalg.norm(graphs[0]["output"][1][2]
+                                          - graphs[1]["output"][1][2]), 1.)
+        points = np.array([[0., 0., 0.], [1., 2., 3.]])
+        for k, expected in enumerate(fixture()[1]):
+            measurements = []
+            for captured in graphs:
+                graph = captured["graph"]
+                edges = [graph.at(i) for i in range(graph.size())
+                         if isinstance(graph.at(i), gtsam.BetweenFactorSimilarity3)]
+                measurements.append(edges[k].measured())
+            for measured in measurements:
+                np.testing.assert_allclose(
+                    [measured.transformFrom(p) for p in points],
+                    transform(points, expected), atol=1e-7)
+
+
 if __name__ == "__main__":
     unittest.main()

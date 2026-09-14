@@ -783,7 +783,14 @@ class Sim3LoopOptimizer:
         ], dtype=np.float64)
         between_noise = gtsam.noiseModel.Diagonal.Sigmas(between_sigmas)
         for k in range(n_chunks - 1):
-            rel = init_sim3[k].between(init_sim3[k + 1])
+            # GPS anchoring changes the initial guess, never the visual measurement.
+            visual_i = self._gtsam_sim3_from_srt(
+                *self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k]))
+            )
+            visual_j = self._gtsam_sim3_from_srt(
+                *self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k + 1]))
+            )
+            rel = visual_i.between(visual_j)
             graph.add(gtsam.BetweenFactorSimilarity3(X(k), X(k + 1), rel, between_noise))
 
         # optional weak global-scale prior on chunk 0

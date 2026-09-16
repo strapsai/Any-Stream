@@ -16,10 +16,13 @@ def main():
     args = parser.parse_args()
     request, metadata = read_bundle(args.request)
     graph = validate_graph(request["graph"])
-    poses, diagnostics = solve(graph, **request["parameters"],
+    poses, diagnostics = solve(graph,
+                               **request["parameters"],
                                initial_absolutes=request.get("initial_absolutes"))
     validate_poses(poses)
-    diagnostics["environment"] = dict(python=platform.python_version(), numpy=np.__version__, scipy=scipy.__version__)
+    diagnostics["environment"] = dict(python=platform.python_version(),
+                                      numpy=np.__version__,
+                                      scipy=scipy.__version__)
     write_bundle(args.output, dict(absolutes=poses, diagnostics=diagnostics), metadata)
 
 

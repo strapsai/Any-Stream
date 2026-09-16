@@ -140,15 +140,19 @@ def main():
                 if args.mode == 'streamer':
                     streamer.process_chunk(request['image_paths'],
                                            final=bool(request.get('final', False)),
-                                           observations_only=bool(metric.get('inference_observations_only', False)))
+                                           observations_only=bool(
+                                               metric.get('inference_observations_only', False)))
                     observation = streamer.metric_last_observation
                     pred = observation['predictions']
-                    fields = ['depth', 'conf', 'mask', 'extrinsics', 'intrinsics', 'processed_images']
+                    fields = [
+                        'depth', 'conf', 'mask', 'extrinsics', 'intrinsics', 'processed_images'
+                    ]
                     arrays = {key: np.asarray(getattr(pred, key)) for key in fields}
                     if metric.get('inference_sparse_world_points', False):
                         # Exactly the consumer's 4-mod-8 pixel lattice. Preserve
                         # predicted values rather than re-lifting rounded depth.
-                        arrays['world_points_sparse'] = np.asarray(pred.world_points)[:, 4::8, 4::8].copy()
+                        arrays['world_points_sparse'] = np.asarray(pred.world_points)[:, 4::8,
+                                                                                      4::8].copy()
                     else:
                         arrays['world_points'] = np.asarray(pred.world_points)
                     s, R, t = observation['visual_pose']
@@ -177,8 +181,8 @@ def main():
                          sha256=digest,
                          payload_bytes=result.stat().st_size,
                          payload_fields=list(arrays),
-                         payload_write_seconds=payload_written-payload_started,
-                         payload_hash_seconds=time.monotonic()-payload_written,
+                         payload_write_seconds=payload_written - payload_started,
+                         payload_hash_seconds=time.monotonic() - payload_written,
                          compute_seconds=compute_seconds,
                          wall_seconds=time.monotonic() - start,
                          gpu_peak_allocated_mib=torch.cuda.max_memory_allocated() / 2**20,

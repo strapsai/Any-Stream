@@ -57,9 +57,12 @@ def solve(
     radial loss, and the incompatible combination raises ValueError."""
     from .metric_io import validate_graph
     validate_graph(data)
-    for name, value in dict(gps_sigma=gps_sigma, overlap_sigma=overlap_sigma,
-                            rot_sigma=rot_sigma, scale_sigma=scale_sigma,
-                            loop_sigma=loop_sigma, tolerance=tolerance).items():
+    for name, value in dict(gps_sigma=gps_sigma,
+                            overlap_sigma=overlap_sigma,
+                            rot_sigma=rot_sigma,
+                            scale_sigma=scale_sigma,
+                            loop_sigma=loop_sigma,
+                            tolerance=tolerance).items():
         if not np.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")
     if anchor_delta_m is not None and (not np.isfinite(anchor_delta_m) or anchor_delta_m <= 0):
@@ -81,11 +84,8 @@ def solve(
     for k, (start, end) in enumerate(data['state']['chunk_indices']):
         good = np.flatnonzero(data['valid_gps'][start:end])[::3]
         if len(good):
-            terms.append(('gps',
-                k,
-                cam[k][good] - pivots[k],
-                data['gps'][start:end][good],
-                gps_sigma * np.sqrt(len(good)) if gps_group else gps_sigma))
+            terms.append(('gps', k, cam[k][good] - pivots[k], data['gps'][start:end][good],
+                          gps_sigma * np.sqrt(len(good)) if gps_group else gps_sigma))
     for k, (a, b) in enumerate(data['seams']):
         if not len(a):
             continue
@@ -94,11 +94,8 @@ def solve(
         step = max(1, len(a) // 80)
         a = a[::step]
         b = b[::step]
-        terms.append(('overlap',
-            k,
-            transform(a, base[k]) - pivots[k],
-            transform(b, base[k + 1]) - pivots[k + 1],
-            overlap_sigma * np.sqrt(len(a))))
+        terms.append(('overlap', k, transform(a, base[k]) - pivots[k],
+                      transform(b, base[k + 1]) - pivots[k + 1], overlap_sigma * np.sqrt(len(a))))
     for loop in data.get('loops', []):
         i, j = (loop['i'], loop['j'])
         a = loop['a'][::2]
@@ -106,18 +103,14 @@ def solve(
         step = max(1, len(a) // 60)
         a = a[::step]
         b = b[::step]
-        terms.append(('loop',
-            i,
-            transform(a, base[i]) - pivots[i],
-            transform(b, base[j]) - pivots[j],
-            loop_sigma * np.sqrt(len(a)),
-            j))
+        terms.append(('loop', i, transform(a, base[i]) - pivots[i],
+                      transform(b, base[j]) - pivots[j], loop_sigma * np.sqrt(len(a)), j))
     for anchor in data.get('anchors', []):
         k = anchor['chunk']
         a = np.asarray(anchor['local'])
         b = np.asarray(anchor['target'])
-        terms.append(('anchor', k, transform(a, base[k]) - pivots[k], b,
-                      anchor['sigma'] * np.sqrt(len(a))))
+        terms.append(
+            ('anchor', k, transform(a, base[k]) - pivots[k], b, anchor['sigma'] * np.sqrt(len(a))))
     # Optional moment summaries preserve group squared error only.
     if compress:
         compressed = []
@@ -131,16 +124,13 @@ def solve(
             w = np.maximum(w, 0.0)
             virtual = (V * np.sqrt(6 * w)).T
             paired = np.concatenate([mean + virtual, mean - virtual])
-            compressed.append((t[0],
-                t[1],
-                paired[:, :3],
-                paired[:, 3:],
-                sigma * np.sqrt(len(paired) / len(joint)),
-                *t[5:]))
+            compressed.append((t[0], t[1], paired[:, :3], paired[:, 3:],
+                               sigma * np.sqrt(len(paired) / len(joint)), *t[5:]))
         terms = compressed
     # Sparsity follows the chunks incident on each residual group.
     sizes = [len(t[2]) * 3 for t in terms]
-    nres = sum(sizes) + (n - 1) * 6 + int(global_scale_sigma > 0) + (3 * n if gravity_sigma is not None else 0) + nbias
+    nres = sum(sizes) + (n - 1) * 6 + int(
+        global_scale_sigma > 0) + (3 * n if gravity_sigma is not None else 0) + nbias
     sparsity = lil_matrix((nres, n * 7 + nbias), dtype=int)
     off = 0
     for t, size in zip(terms, sizes):
@@ -167,9 +157,8 @@ def solve(
     A = np.concatenate([t[2] for t in terms])
     B = np.concatenate([t[3] for t in terms])
     I = np.concatenate([np.full(len(t[2]), t[1], int) for t in terms])
-    J = np.concatenate([np.full(len(t[2]),
-        t[5] if len(t) > 5 else min(t[1] + 1, n - 1),
-        int) for t in terms])
+    J = np.concatenate(
+        [np.full(len(t[2]), t[5] if len(t) > 5 else min(t[1] + 1, n - 1), int) for t in terms])
     group = np.concatenate([np.full(len(t[2]), k, int) for k, t in enumerate(terms)])
     is_gps = np.array([t[0] in ('gps', 'anchor') for t in terms])
     gps_points = is_gps[group]
@@ -192,7 +181,8 @@ def solve(
         if vector_loss:
             q = np.sum(r * r, axis=1)
             if anchor_delta_m is not None:
-                q[anchor_points] = np.sum((pred[anchor_points] - target[anchor_points]) ** 2, axis=1) / anchor_delta_m ** 2
+                q[anchor_points] = np.sum(
+                    (pred[anchor_points] - target[anchor_points])**2, axis=1) / anchor_delta_m**2
             r *= np.sqrt(2 / (np.sqrt(1 + q) + 1))[:, None]
         elif block_loss:
             q = np.bincount(group, weights=np.sum(r * r, axis=1), minlength=len(terms))
@@ -242,24 +232,37 @@ def solve(
         from .metric_jacobian import make_surface_jacobian
         gravity_vectors = None if gravity_sigma is None else np.array(
             [pose[1] @ target[2, :] for pose, target in zip(base, data['gravity_targets'])])
-        jacobian = make_surface_jacobian(A=A, B=B, I=I, J=J, pivots=pivots, sigma=sigma,
-            gps_points=gps_points, anchor_points=anchor_points, gps_only_points=gps_only_points,
-            nres=nres, rot_sigma=rot_sigma, scale_sigma=scale_sigma, vector_loss=vector_loss,
-            anchor_delta_m=anchor_delta_m, fix_scale=fix_scale,
-            global_scale_sigma=global_scale_sigma, gravity_vectors=gravity_vectors,
-            gravity_sigma=gravity_sigma, gps_bias_sigma=gps_bias_sigma)
+        jacobian = make_surface_jacobian(A=A,
+                                         B=B,
+                                         I=I,
+                                         J=J,
+                                         pivots=pivots,
+                                         sigma=sigma,
+                                         gps_points=gps_points,
+                                         anchor_points=anchor_points,
+                                         gps_only_points=gps_only_points,
+                                         nres=nres,
+                                         rot_sigma=rot_sigma,
+                                         scale_sigma=scale_sigma,
+                                         vector_loss=vector_loss,
+                                         anchor_delta_m=anchor_delta_m,
+                                         fix_scale=fix_scale,
+                                         global_scale_sigma=global_scale_sigma,
+                                         gravity_vectors=gravity_vectors,
+                                         gravity_sigma=gravity_sigma,
+                                         gps_bias_sigma=gps_bias_sigma)
     t0 = time.time()
     r = least_squares(residual,
-        initial,
-        jac=jacobian,
-        jac_sparsity=sparsity.tocsr(),
-        x_scale="jac" if x_scale_mode == "jac" else 1.0,
-        loss=loss,
-        f_scale=1.0,
-        max_nfev=max_nfev,
-        ftol=tolerance,
-        xtol=tolerance,
-        gtol=tolerance)
+                      initial,
+                      jac=jacobian,
+                      jac_sparsity=sparsity.tocsr(),
+                      x_scale="jac" if x_scale_mode == "jac" else 1.0,
+                      loss=loss,
+                      f_scale=1.0,
+                      max_nfev=max_nfev,
+                      ftol=tolerance,
+                      xtol=tolerance,
+                      gtol=tolerance)
     z = r.x[:n * 7].reshape(n, 7)
     out = []
     for k, (s, R, t) in enumerate(base):
@@ -268,14 +271,35 @@ def solve(
         p = pivots[k]
         out.append((s * u, Q @ R, u * (Q @ (t - p)) + p + z[k, 3:6]))
     diag = dict(success=bool(r.success),
-        status=int(r.status),
-        message=r.message,
-        nfev=r.nfev,
-        cost=float(r.cost),
-        initial_cost=initial_cost,
-        warm_start_chunks=0 if initial_absolutes is None else len(initial_absolutes),
-        optimality=float(r.optimality),
-        seconds=time.time() - t0,
-        gps_bias_m=r.x[n * 7:].tolist() if nbias else None,
-        parameters=dict(gps_sigma=gps_sigma, overlap_sigma=overlap_sigma, gps_group=gps_group, rot_sigma=rot_sigma, scale_sigma=scale_sigma, loss=loss, global_scale_sigma=global_scale_sigma, fix_scale=fix_scale, loop_sigma=loop_sigma, loop_count=len(data.get('loops', [])), anchor_count=len(data.get('anchors', [])), anchor_delta_m=anchor_delta_m, gps_bias_sigma=gps_bias_sigma, gravity_sigma=gravity_sigma, compress=compress, block_loss=block_loss, vector_loss=vector_loss, gps_only_block=gps_only_block, tolerance=tolerance, x_scale_mode=x_scale_mode, jacobian_mode=jacobian_mode, stored_factor_points=sum((len(t[2]) for t in terms))))
+                status=int(r.status),
+                message=r.message,
+                nfev=r.nfev,
+                cost=float(r.cost),
+                initial_cost=initial_cost,
+                warm_start_chunks=0 if initial_absolutes is None else len(initial_absolutes),
+                optimality=float(r.optimality),
+                seconds=time.time() - t0,
+                gps_bias_m=r.x[n * 7:].tolist() if nbias else None,
+                parameters=dict(gps_sigma=gps_sigma,
+                                overlap_sigma=overlap_sigma,
+                                gps_group=gps_group,
+                                rot_sigma=rot_sigma,
+                                scale_sigma=scale_sigma,
+                                loss=loss,
+                                global_scale_sigma=global_scale_sigma,
+                                fix_scale=fix_scale,
+                                loop_sigma=loop_sigma,
+                                loop_count=len(data.get('loops', [])),
+                                anchor_count=len(data.get('anchors', [])),
+                                anchor_delta_m=anchor_delta_m,
+                                gps_bias_sigma=gps_bias_sigma,
+                                gravity_sigma=gravity_sigma,
+                                compress=compress,
+                                block_loss=block_loss,
+                                vector_loss=vector_loss,
+                                gps_only_block=gps_only_block,
+                                tolerance=tolerance,
+                                x_scale_mode=x_scale_mode,
+                                jacobian_mode=jacobian_mode,
+                                stored_factor_points=sum((len(t[2]) for t in terms))))
     return (out, diag)

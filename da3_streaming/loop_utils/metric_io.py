@@ -103,14 +103,14 @@ def _encode(value, arrays):
     raise ValueError(f"unsupported payload type {type(value).__name__}")
 
 
-def write_bundle(folder, payload, metadata):
+def write_bundle(folder, payload, metadata, *, compressed=True):
     """Create an immutable local bundle, committing the manifest after its blob."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=False)
     arrays = {}
     tree = _encode(payload, arrays)
     blob = folder / "arrays.npz"
-    np.savez_compressed(blob, **arrays)
+    (np.savez_compressed if compressed else np.savez)(blob, **arrays)
     manifest = dict(schema_version=SCHEMA, complete=True, metadata=metadata,
                     arrays_file=blob.name, arrays_sha256=hashlib.sha256(blob.read_bytes()).hexdigest(), payload=tree)
     tmp = folder / "manifest.json.tmp"

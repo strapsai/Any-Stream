@@ -23,10 +23,11 @@ def problem():
     return graph
 
 
-def test_transport_preserves_numeric_observations_and_detects_corruption(tmp_path):
+@pytest.mark.parametrize("compressed", [True, False])
+def test_transport_preserves_numeric_observations_and_detects_corruption(tmp_path, compressed):
     graph = problem()
     graph['seams'][0] = tuple(a.astype(np.float32) for a in graph['seams'][0])
-    path = write_bundle(tmp_path/'graph', dict(graph=graph), dict(epoch=1))
+    path = write_bundle(tmp_path/'graph', dict(graph=graph), dict(epoch=1), compressed=compressed)
     payload, meta = read_bundle(path)
     assert meta == dict(epoch=1)
     assert payload['graph']['seams'][0][0].dtype == np.float32

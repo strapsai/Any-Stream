@@ -116,7 +116,9 @@ def main():
             import yaml
             sys.path.insert(0, args.ros_module_dir)
             from anystreaming import AnyStreamer
-            streamer = AnyStreamer(yaml.safe_load(Path(args.config).read_text()))
+            config = yaml.safe_load(Path(args.config).read_text())
+            metric = config.get('MetricGraph', {})
+            streamer = AnyStreamer(config)
         else:
             model = load_ufm(args.checkpoint)
         torch.cuda.synchronize()
@@ -137,18 +139,23 @@ def main():
                 torch.cuda.reset_peak_memory_stats()
                 if args.mode == 'streamer':
                     streamer.process_chunk(request['image_paths'],
-                                           final=bool(request.get('final', False)))
+                                           final=bool(request.get('final', False)),
+                                           observations_only=bool(metric.get('inference_observations_only', False)))
                     observation = streamer.metric_last_observation
                     pred = observation['predictions']
-                    arrays = {
-                        key: np.asarray(getattr(pred, key))
-                        for key in ('depth', 'conf', 'mask', 'extrinsics', 'intrinsics',
-                                    'processed_images', 'world_points')
-                    }
+                    fields = ['depth', 'conf', 'mask', 'extrinsics', 'intrinsics', 'processed_images']
+                    arrays = {key: np.asarray(getattr(pred, key)) for key in fields}
+                    if metric.get('inference_sparse_world_points', False):
+                        # Exactly the consumer's 4-mod-8 pixel lattice. Preserve
+                        # predicted values rather than re-lifting rounded depth.
+                        arrays['world_points_sparse'] = np.asarray(pred.world_points)[:, 4::8, 4::8].copy()
+                    else:
+                        arrays['world_points'] = np.asarray(pred.world_points)
                     s, R, t = observation['visual_pose']
                     details = dict(visual_pose=[float(s), R.tolist(),
                                                 t.tolist()],
-                                   chunk_index=streamer.chunk_idx - 1)
+                                   chunk_index=streamer.chunk_idx - 1,
+                                   chunk_timings=streamer.last_chunk_timings)
                 else:
                     with np.load(request['input_npz'], allow_pickle=False) as x:
                         A = x['a'].copy()
@@ -156,15 +163,22 @@ def main():
                     arrays, details = ufm_pair(model, A, B)
                 torch.cuda.synchronize()
                 compute_seconds = time.monotonic() - start
+                payload_started = time.monotonic()
                 result = root / (ident + '.npz')
                 temporary = root / (ident + '.tmp.npz')
                 np.savez(temporary, **arrays)
                 temporary.replace(result)
+                payload_written = time.monotonic()
+                digest = hashlib.sha256(result.read_bytes()).hexdigest()
                 reply(
                     dict(event='result',
                          id=ident,
                          path=str(result),
-                         sha256=hashlib.sha256(result.read_bytes()).hexdigest(),
+                         sha256=digest,
+                         payload_bytes=result.stat().st_size,
+                         payload_fields=list(arrays),
+                         payload_write_seconds=payload_written-payload_started,
+                         payload_hash_seconds=time.monotonic()-payload_written,
                          compute_seconds=compute_seconds,
                          wall_seconds=time.monotonic() - start,
                          gpu_peak_allocated_mib=torch.cuda.max_memory_allocated() / 2**20,

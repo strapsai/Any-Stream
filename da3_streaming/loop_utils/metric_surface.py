@@ -39,12 +39,16 @@ def solve(
     anchor_delta_m=1.0,
     gps_bias_sigma=None,
     initial_absolutes=None,
+    x_scale_mode="unit",
 ):
     """Solve cached chunk geometry; defaults reproduce the selected radial-loss graph.
 
     Overlap/loop even-indexed pairs supply factors; odd-indexed pairs are
     reserved. Fixed-reference anchors use all supplied pairs. Warm starts are
     expressed relative to the original base; they never replace the priors.
+    x_scale_mode="jac" scales trust-region steps by inverse Jacobian column
+    norms. It changes neither the residual nor the original visual priors.
+    The default "unit" preserves historical numerical reproduction.
     No ground-plane constraint, correspondence discovery, or ROS integration is
     performed here. Return (absolute mapper Sim3 tuples, solver diagnostics).
 
@@ -61,6 +65,8 @@ def solve(
         raise ValueError("anchor_delta_m must be finite and positive")
     if compress and vector_loss:
         raise ValueError('Moment summaries do not preserve per-point radial robust loss')
+    if x_scale_mode not in ('unit', 'jac'):
+        raise ValueError('x_scale_mode must be unit or jac')
     n = len(data['absolutes'])
     nbias = 3 if gps_bias_sigma is not None else 0
     base = data['absolutes']
@@ -230,6 +236,7 @@ def solve(
     r = least_squares(residual,
         initial,
         jac_sparsity=sparsity.tocsr(),
+        x_scale="jac" if x_scale_mode == "jac" else 1.0,
         loss=loss,
         f_scale=1.0,
         max_nfev=max_nfev,
@@ -253,5 +260,5 @@ def solve(
         optimality=float(r.optimality),
         seconds=time.time() - t0,
         gps_bias_m=r.x[n * 7:].tolist() if nbias else None,
-        parameters=dict(gps_sigma=gps_sigma, overlap_sigma=overlap_sigma, gps_group=gps_group, rot_sigma=rot_sigma, scale_sigma=scale_sigma, loss=loss, global_scale_sigma=global_scale_sigma, fix_scale=fix_scale, loop_sigma=loop_sigma, loop_count=len(data.get('loops', [])), anchor_count=len(data.get('anchors', [])), anchor_delta_m=anchor_delta_m, gps_bias_sigma=gps_bias_sigma, gravity_sigma=gravity_sigma, compress=compress, block_loss=block_loss, vector_loss=vector_loss, gps_only_block=gps_only_block, tolerance=tolerance, stored_factor_points=sum((len(t[2]) for t in terms))))
+        parameters=dict(gps_sigma=gps_sigma, overlap_sigma=overlap_sigma, gps_group=gps_group, rot_sigma=rot_sigma, scale_sigma=scale_sigma, loss=loss, global_scale_sigma=global_scale_sigma, fix_scale=fix_scale, loop_sigma=loop_sigma, loop_count=len(data.get('loops', [])), anchor_count=len(data.get('anchors', [])), anchor_delta_m=anchor_delta_m, gps_bias_sigma=gps_bias_sigma, gravity_sigma=gravity_sigma, compress=compress, block_loss=block_loss, vector_loss=vector_loss, gps_only_block=gps_only_block, tolerance=tolerance, x_scale_mode=x_scale_mode, stored_factor_points=sum((len(t[2]) for t in terms))))
     return (out, diag)

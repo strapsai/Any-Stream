@@ -52,16 +52,17 @@ def test_warm_start_preserves_the_original_objective_and_base():
     assert first['cost'] < first['initial_cost'] / 10
 
 
-def test_surface_objective_respects_a_rigid_change_of_world_frame():
+@pytest.mark.parametrize("x_scale_mode", ["unit", "jac"])
+def test_surface_objective_respects_a_rigid_change_of_world_frame(x_scale_mode):
     graph = problem()
-    a, da = solve(graph, max_nfev=200)
+    a, da = solve(graph, max_nfev=200, x_scale_mode=x_scale_mode)
     Q = Rotation.from_rotvec([.4, -.2, .1]).as_matrix()
     t = np.array([100., -200., 40.])
     other = copy.deepcopy(graph)
     other['absolutes'] = [(s, Q @ R, Q @ p + t) for s, R, p in graph['absolutes']]
     other['gps'] = graph['gps'] @ Q.T + t
     other['anchors'][0]['target'] = graph['anchors'][0]['target'] @ Q.T + t
-    b, db = solve(other, max_nfev=200)
+    b, db = solve(other, max_nfev=200, x_scale_mode=x_scale_mode)
     assert abs(da['cost'] - db['cost']) < 1e-6
     for pa, pb in zip(a, b):
         np.testing.assert_allclose(transform(graph['seams'][0][0], pa) @ Q.T + t,
@@ -86,3 +87,24 @@ def test_single_chunk_anchored_graph_is_supported():
     graph['gps'], graph['valid_gps'], graph['seams'] = graph['gps'][:6], graph['valid_gps'][:6], []
     poses, diag = solve(graph, max_nfev=100)
     assert len(poses) == 1 and diag['cost'] < diag['initial_cost']
+
+
+def test_jacobian_step_scaling_preserves_the_objective_and_geometric_solution():
+    graph = problem()
+    unit_poses, unit = solve(graph, max_nfev=200, x_scale_mode="unit")
+    jac_poses, jac = solve(graph, max_nfev=200, x_scale_mode="jac")
+    assert unit["success"] and jac["success"]
+    assert unit["initial_cost"] == jac["initial_cost"]
+    assert abs(unit["cost"] - jac["cost"]) < 1e-7
+    for a, b in zip(unit_poses, jac_poses):
+        np.testing.assert_allclose(transform(graph["seams"][0][0], a),
+                                   transform(graph["seams"][0][0], b), atol=2e-4)
+    # Starting from the same pose must have exactly the same objective under
+    # either numerical step metric. This checks a nonzero residual as well.
+    _, a = solve(graph, initial_absolutes=graph["absolutes"], max_nfev=1,
+                 x_scale_mode="unit")
+    _, b = solve(graph, initial_absolutes=graph["absolutes"], max_nfev=1,
+                 x_scale_mode="jac")
+    assert a["cost"] == b["cost"] == unit["initial_cost"]
+    with pytest.raises(ValueError, match="x_scale_mode"):
+        solve(graph, x_scale_mode="unrecognized")

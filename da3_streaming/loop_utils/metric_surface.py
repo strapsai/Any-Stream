@@ -40,6 +40,7 @@ def solve(
     gps_bias_sigma=None,
     initial_absolutes=None,
     x_scale_mode="unit",
+    jacobian_mode="finite_difference",
 ):
     """Solve cached chunk geometry; defaults reproduce the selected radial-loss graph.
 
@@ -67,6 +68,10 @@ def solve(
         raise ValueError('Moment summaries do not preserve per-point radial robust loss')
     if x_scale_mode not in ('unit', 'jac'):
         raise ValueError('x_scale_mode must be unit or jac')
+    if jacobian_mode not in ('finite_difference', 'analytic'):
+        raise ValueError('jacobian_mode must be finite_difference or analytic')
+    if jacobian_mode == 'analytic' and block_loss and not vector_loss:
+        raise ValueError('analytic Jacobian does not support group-norm robust loss')
     n = len(data['absolutes'])
     nbias = 3 if gps_bias_sigma is not None else 0
     base = data['absolutes']
@@ -232,9 +237,21 @@ def solve(
     # Report an actual SciPy objective cost, including its optional outer loss.
     # The deployment recipe uses linear outer loss and radial loss internally.
     initial_cost = .5 * float(initial_residual @ initial_residual) if loss == "linear" else None
+    jacobian = '2-point'
+    if jacobian_mode == 'analytic':
+        from .metric_jacobian import make_surface_jacobian
+        gravity_vectors = None if gravity_sigma is None else np.array(
+            [pose[1] @ target[2, :] for pose, target in zip(base, data['gravity_targets'])])
+        jacobian = make_surface_jacobian(A=A, B=B, I=I, J=J, pivots=pivots, sigma=sigma,
+            gps_points=gps_points, anchor_points=anchor_points, gps_only_points=gps_only_points,
+            nres=nres, rot_sigma=rot_sigma, scale_sigma=scale_sigma, vector_loss=vector_loss,
+            anchor_delta_m=anchor_delta_m, fix_scale=fix_scale,
+            global_scale_sigma=global_scale_sigma, gravity_vectors=gravity_vectors,
+            gravity_sigma=gravity_sigma, gps_bias_sigma=gps_bias_sigma)
     t0 = time.time()
     r = least_squares(residual,
         initial,
+        jac=jacobian,
         jac_sparsity=sparsity.tocsr(),
         x_scale="jac" if x_scale_mode == "jac" else 1.0,
         loss=loss,
@@ -260,5 +277,5 @@ def solve(
         optimality=float(r.optimality),
         seconds=time.time() - t0,
         gps_bias_m=r.x[n * 7:].tolist() if nbias else None,
-        parameters=dict(gps_sigma=gps_sigma, overlap_sigma=overlap_sigma, gps_group=gps_group, rot_sigma=rot_sigma, scale_sigma=scale_sigma, loss=loss, global_scale_sigma=global_scale_sigma, fix_scale=fix_scale, loop_sigma=loop_sigma, loop_count=len(data.get('loops', [])), anchor_count=len(data.get('anchors', [])), anchor_delta_m=anchor_delta_m, gps_bias_sigma=gps_bias_sigma, gravity_sigma=gravity_sigma, compress=compress, block_loss=block_loss, vector_loss=vector_loss, gps_only_block=gps_only_block, tolerance=tolerance, x_scale_mode=x_scale_mode, stored_factor_points=sum((len(t[2]) for t in terms))))
+        parameters=dict(gps_sigma=gps_sigma, overlap_sigma=overlap_sigma, gps_group=gps_group, rot_sigma=rot_sigma, scale_sigma=scale_sigma, loss=loss, global_scale_sigma=global_scale_sigma, fix_scale=fix_scale, loop_sigma=loop_sigma, loop_count=len(data.get('loops', [])), anchor_count=len(data.get('anchors', [])), anchor_delta_m=anchor_delta_m, gps_bias_sigma=gps_bias_sigma, gravity_sigma=gravity_sigma, compress=compress, block_loss=block_loss, vector_loss=vector_loss, gps_only_block=gps_only_block, tolerance=tolerance, x_scale_mode=x_scale_mode, jacobian_mode=jacobian_mode, stored_factor_points=sum((len(t[2]) for t in terms))))
     return (out, diag)

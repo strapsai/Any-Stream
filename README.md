@@ -326,3 +326,9 @@ If you find Depth Anything 3 useful in your research or projects, please cite ou
   year={2025}
 }
 ```
+
+### GPS PGO consistency investigation
+
+See [GPS Sim3 corrections and optional weighting controls](docs/gps_pgo/README.md)
+and the [Starling investigation handoff](docs/gps_pgo/investigation.md) for measured
+results, regression checks, and the separately runnable experimental geometry solver.

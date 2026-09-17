@@ -93,7 +93,7 @@ class Sim3GPSFactor(_CustomFactorBase):
 
     Residual layout (5-vec):
         r[0:2] = Unit3(R_k @ v_loc).localCoordinates(Unit3(v_gps))    # heading (on S^2)
-        r[2:5] = s_k * (R_k @ c_loc) + t_k - p_obs                    # position (metric)
+        r[2:5] = X_k.transformFrom(c_loc) - p_obs                    # position (metric)
 
     Jacobian is numerical (central differences on the 7-DOF Sim3 tangent
     [omega(3), v(3), sigma(1)]).
@@ -117,10 +117,8 @@ class Sim3GPSFactor(_CustomFactorBase):
         super().__init__(noise_model, [key], self._error_func)
 
     def _residual(self, X):
-        s = X.scale()
         R = X.rotation().matrix()
-        t = np.asarray(X.translation()).reshape(3)
-        r_pos = s * (R @ self._c_loc) + t - self._p_obs
+        r_pos = X.transformFrom(self._c_loc) - self._p_obs
         v_pred_world = R @ self._v_loc
         if np.linalg.norm(v_pred_world) < 1e-12:
             r_head = np.zeros(2)
@@ -187,6 +185,19 @@ class Sim3LoopOptimizer:
         s = data[7]
         R_mat = R.from_quat(q).as_matrix()
         return s, R_mat, t
+
+    @staticmethod
+    def _gtsam_sim3_from_srt(s, R_mat, t_vec):
+        """Encode mapper action s * R @ p + t in GTSAM's s * (R @ p + t)."""
+        return gtsam.Similarity3(
+            gtsam.Rot3(R_mat), np.asarray(t_vec, dtype=np.float64).reshape(3) / s, s
+        )
+
+    @staticmethod
+    def _srt_from_gtsam_sim3(sim3):
+        """Return the mapper's metric translation, outside the scale operation."""
+        s = float(sim3.scale())
+        return s, sim3.rotation().matrix(), s * np.asarray(sim3.translation()).reshape(3)
 
     @staticmethod
     def _gtsam_pose3_from_rt(R_mat, t_vec):
@@ -658,7 +669,8 @@ class Sim3LoopOptimizer:
         GPS frame. The optimized s_k stretches the chunk interior uniformly about
         its anchor.
 
-        Returns per-chunk absolute GPS-frame Sim3 tuples (s_k, R_k, t_k).
+        Returns mapper tuples (s_k, R_k, t_k), acting as s_k * R_k @ p + t_k.
+        GTSAM stores translation inside scale; convert at both API boundaries.
         """
         _require_gtsam_sim3("optimize_gps_sim3")
 
@@ -683,7 +695,17 @@ class Sim3LoopOptimizer:
         seq_sigma_t = float(cfg.get("seq_sigma_t", seq_sigma))
         seq_sigma_scale = float(cfg.get("scale_bw_sigma", 0.05))
         scale_prior_sigma = float(cfg.get("scale_prior_sigma", 0.0))  # 0 = disabled
-        # TODO: write out details of these params.
+        # Legacy seq_sigma_t is in destination-chunk units. The metric option
+        # uses the INITIAL destination scale; it is approximate if scale changes.
+        seq_sigma_t_m = cfg.get("seq_sigma_t_m")
+        if seq_sigma_t_m is not None:
+            seq_sigma_t_m = float(seq_sigma_t_m)
+            if not np.isfinite(seq_sigma_t_m) or seq_sigma_t_m <= 0.0:
+                raise ValueError("seq_sigma_t_m must be finite and positive")
+        chunk_scale_sigma = float(cfg.get("per_chunk_scale_prior_sigma", 0.0))
+        if not np.isfinite(chunk_scale_sigma) or chunk_scale_sigma < 0.0:
+            raise ValueError("per_chunk_scale_prior_sigma must be finite and nonnegative")
+        normalize_gps = bool(cfg.get("gps_chunk_information_normalization", False))
 
         s_g, R_g, t_g = umeyama
         abs_poses_model = self.sequential_to_absolute_poses(sequential_transforms)
@@ -722,13 +744,27 @@ class Sim3LoopOptimizer:
                 t_k = p_obs_rep - s_k * (R_k @ c_loc_rep)
             else:
                 t_k = s_g * (R_g @ t_m) + t_g
-            init_sim3.append(gtsam.Similarity3(gtsam.Rot3(R_k), gtsam.Point3(*t_k), s_k))
+            init_sim3.append(self._gtsam_sim3_from_srt(s_k, R_k, t_k))
 
         graph = gtsam.NonlinearFactorGraph()
         initial = gtsam.Values()
         X = lambda k: gtsam.symbol('x', k)
         for k in range(n_chunks):
             initial.insert(X(k), init_sim3[k])
+
+        # Downweight repeated, correlated fixes without changing default behavior.
+        # Count only observations accepted by the factor eligibility checks below.
+        gps_counts = {}
+        if normalize_gps:
+            for m in gps_measurements:
+                k = int(m["chunk_k"])
+                if not (0 <= k < n_chunks):
+                    continue
+                finite = all(np.all(np.isfinite(m[field]))
+                             for field in ("p_obs", "v_obs", "c_loc", "v_loc"))
+                if (finite and np.linalg.norm(m["v_obs"]) >= 1e-8
+                        and np.linalg.norm(m["v_loc"]) >= 1e-8):
+                    gps_counts[k] = gps_counts.get(k, 0) + 1
 
         # 5-DOF GPS Factors
         n_gps_factors = 0
@@ -757,6 +793,8 @@ class Sim3LoopOptimizer:
                 if cov3[2, 2] < 1e-9:
                     cov3[2, 2] = 100.0 * max(cov3[0, 0], cov3[1, 1], 1e-6)
                 cov5[2:5, 2:5] = cov3 + 1e-9 * np.eye(3)
+            if normalize_gps:
+                cov5 *= gps_counts[k]
             noise = gtsam.noiseModel.Gaussian.Covariance(cov5)
             #TODO: check if the noise model is sensible.
 
@@ -771,8 +809,28 @@ class Sim3LoopOptimizer:
         ], dtype=np.float64)
         between_noise = gtsam.noiseModel.Diagonal.Sigmas(between_sigmas)
         for k in range(n_chunks - 1):
-            rel = init_sim3[k].between(init_sim3[k + 1])
-            graph.add(gtsam.BetweenFactorSimilarity3(X(k), X(k + 1), rel, between_noise))
+            # GPS anchoring changes the initial guess, never the visual measurement.
+            visual_i = self._gtsam_sim3_from_srt(
+                *self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k]))
+            )
+            visual_j = self._gtsam_sim3_from_srt(
+                *self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k + 1]))
+            )
+            rel = visual_i.between(visual_j)
+            edge_noise = between_noise
+            if seq_sigma_t_m is not None:
+                edge_sigmas = between_sigmas.copy()
+                edge_sigmas[3:6] = seq_sigma_t_m / float(init_sim3[k + 1].scale())
+                edge_noise = gtsam.noiseModel.Diagonal.Sigmas(edge_sigmas)
+            graph.add(gtsam.BetweenFactorSimilarity3(X(k), X(k + 1), rel, edge_noise))
+
+        if chunk_scale_sigma > 0.0:
+            # Approximately fix each initial log-scale, with very weak pose priors.
+            scale_noise = gtsam.noiseModel.Diagonal.Sigmas(
+                np.array([1e6] * 6 + [chunk_scale_sigma], dtype=np.float64)
+            )
+            for k in range(n_chunks):
+                graph.addPriorSimilarity3(X(k), init_sim3[k], scale_noise)
 
         # optional weak global-scale prior on chunk 0
         if scale_prior_sigma > 0.0:
@@ -794,17 +852,15 @@ class Sim3LoopOptimizer:
         print(f"  [GPS-PGO-Sim3] {n_gps_factors} GPS factors, {n_chunks - 1} between factors")
         print(f"  [GPS-PGO-Sim3] init={init_method}  "
               f"sigmas: head={heading_sigma}  gps_t={gps_sigma_t}  "
-              f"seq_R={seq_sigma_R}  seq_t={seq_sigma_t}  seq_s={seq_sigma_scale}")
+              f"seq_R={seq_sigma_R}  seq_t_local={seq_sigma_t}  seq_s={seq_sigma_scale}  "
+              f"seq_t_m={seq_sigma_t_m}  gps_grouped={normalize_gps}  "
+              f"per_chunk_scale_prior={chunk_scale_sigma}")
         print(f"  [GPS-PGO-Sim3] LM: initial error={initial_error:.6f}  "
               f"final error={final_error:.6f}  iterations={iterations}")
         
         out = []
         for k in range(n_chunks):
-            Xk = result.atSimilarity3(X(k))
-            s_k = float(Xk.scale())
-            R_k = Xk.rotation().matrix()
-            t_k = np.asarray(Xk.translation()).reshape(3)
-            out.append((s_k, R_k, t_k))
+            out.append(self._srt_from_gtsam_sim3(result.atSimilarity3(X(k))))
         return out
 
 # ======== TEST CODE ========

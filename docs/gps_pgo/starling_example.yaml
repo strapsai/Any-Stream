@@ -1,0 +1,10 @@
+# Merge into an existing config; dataset-specific ablation, not a new default.
+Loop:
+  SIM3_Optimizer:
+    gps_sigma_t: 2.0
+    heading_sigma: 1000000.0
+    gps_chunk_information_normalization: true
+    seq_sigma_R: 0.005
+    seq_sigma_t_m: 0.1
+    per_chunk_scale_prior_sigma: 0.00001
+    max_iterations: 100

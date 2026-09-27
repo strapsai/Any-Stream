@@ -1,0 +1,123 @@
+{
+    "gtsam_cached_flight": {
+        "20_consistent_sigma4": {
+            "maximum_point_coordinate_difference_m": 2.3387188221590804e-06
+        },
+        "gtsam_grouped_fixedscale_seqt0.1m": {
+            "maximum_point_coordinate_difference_m": 2.6047885199886878e-06
+        }
+    },
+    "original_worktrees": {
+        "Any-Stream": {
+            "head": "4039f9544705e865f40b3a8541afeb8e6d61c47f",
+            "status": "M da3_streaming/loop_utils/sim3loop.py"
+        },
+        "anystream_ros": {
+            "head": "73c5b68b096336931750f66cc620e0bce5b2d047",
+            "status": "clean"
+        }
+    },
+    "portable_solver": {
+        "audited_batched_max_coordinate_difference_m": 0.0,
+        "reported_reference_map_difference_p90_m": 0.003409240028159595,
+        "solver": {
+            "cost": 272.32947549149014,
+            "message": "`ftol` termination condition is satisfied.",
+            "nfev": 49,
+            "optimality": 0.060273672736123274,
+            "parameters": {
+                "block_loss": false,
+                "compress": false,
+                "fix_scale": true,
+                "global_scale_sigma": 0.0,
+                "gps_group": true,
+                "gps_only_block": false,
+                "gps_sigma": 2.0,
+                "gravity_sigma": null,
+                "loop_count": 1,
+                "loop_sigma": 0.1,
+                "loss": "linear",
+                "overlap_sigma": 0.3,
+                "rot_sigma": 0.005,
+                "scale_sigma": 0.03,
+                "stored_factor_points": 3691,
+                "tolerance": 1e-07,
+                "vector_loss": true
+            },
+            "seconds": 3.4761455059051514,
+            "status": 2,
+            "success": true
+        }
+    },
+    "rerun_metrics": {
+        "/world/01_prior_sigma4": {
+            "adjacent": {
+                "correspondences": 20458,
+                "median_m": 1.2193819284439087,
+                "p90_m": 4.652559900283813,
+                "vertical_p90_m": 1.2697520494461059
+            },
+            "revisit": {
+                "correspondences": 165,
+                "median_m": 6.05984354019165,
+                "p90_m": 7.355459976196289,
+                "vertical_p90_m": 2.991714096069336
+            }
+        },
+        "/world/20_consistent_sigma4": {
+            "adjacent": {
+                "correspondences": 20458,
+                "median_m": 0.5737451910972595,
+                "p90_m": 3.011772727966308,
+                "vertical_p90_m": 0.796067190170288
+            },
+            "revisit": {
+                "correspondences": 165,
+                "median_m": 2.4827933311462402,
+                "p90_m": 2.904497528076172,
+                "vertical_p90_m": 2.2256400108337404
+            }
+        },
+        "/world/61_fixedscale_tightrot": {
+            "adjacent": {
+                "correspondences": 20458,
+                "median_m": 0.3659757971763611,
+                "p90_m": 1.7027409553527821,
+                "vertical_p90_m": 0.3490375518798828
+            },
+            "revisit": {
+                "correspondences": 165,
+                "median_m": 6.95583438873291,
+                "p90_m": 7.24685697555542,
+                "vertical_p90_m": 0.9671202182769775
+            }
+        },
+        "/world/invariant_radial": {
+            "adjacent": {
+                "correspondences": 20458,
+                "median_m": 0.44080549478530884,
+                "p90_m": 1.7454642653465269,
+                "vertical_p90_m": 0.3521998107433319
+            },
+            "revisit": {
+                "correspondences": 165,
+                "median_m": 0.44236284494400024,
+                "p90_m": 0.7499863982200622,
+                "vertical_p90_m": 0.10511584281921386
+            }
+        }
+    },
+    "runtime": "Existing reid-dev / anystream Python environment; no installs",
+    "scope": "Production GPS fixes and optional controls; offline geometry/visibility prototypes; no ROS optimizer integration or deployment",
+    "tests": {
+        "Any-Stream": {
+            "changed_tracked_files_ast_and_size_check": "passed",
+            "test_methods_passed": 15
+        },
+        "anystream_ros": {
+            "changed_tracked_files_ast_and_size_check": "passed",
+            "test_methods_passed": 4
+        }
+    },
+    "validation_date": "2026-09-14"
+}

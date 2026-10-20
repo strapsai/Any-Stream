@@ -38,6 +38,7 @@ def solve(
     tolerance=1e-07,
     anchor_delta_m=1.0,
     gps_bias_sigma=None,
+    gps_altitude_mode="absolute",
     initial_absolutes=None,
     x_scale_mode="unit",
     jacobian_mode="finite_difference",
@@ -75,6 +76,12 @@ def solve(
         raise ValueError('jacobian_mode must be finite_difference or analytic')
     if jacobian_mode == 'analytic' and block_loss and not vector_loss:
         raise ValueError('analytic Jacobian does not support group-norm robust loss')
+    if gps_altitude_mode not in ("absolute", "reference"):
+        raise ValueError("gps_altitude_mode must be absolute or reference")
+    # A fixed visual reference establishes the vertical datum. Before the first
+    # anchor GPS still establishes all three coordinates; afterwards retain GPS
+    # XY and let the reference plus visual factors determine height.
+    reference_altitude = gps_altitude_mode == "reference" and bool(data.get("anchors"))
     n = len(data['absolutes'])
     nbias = 3 if gps_bias_sigma is not None else 0
     base = data['absolutes']
@@ -165,6 +172,9 @@ def solve(
     anchor_points = np.array([t[0] == 'anchor' for t in terms])[group]
     gps_only_points = np.array([t[0] == 'gps' for t in terms])[group]
     sigma = np.concatenate([np.broadcast_to(np.asarray(t[4]), (len(t[2]), 3)) for t in terms])
+
+    if reference_altitude:
+        sigma[gps_only_points, 2] = np.inf
 
     # Corrections act about initial camera centroids in metric world coordinates.
     def residual(z):
@@ -293,6 +303,8 @@ def solve(
                                 anchor_count=len(data.get('anchors', [])),
                                 anchor_delta_m=anchor_delta_m,
                                 gps_bias_sigma=gps_bias_sigma,
+                                gps_altitude_mode=gps_altitude_mode,
+                                reference_altitude_active=reference_altitude,
                                 gravity_sigma=gravity_sigma,
                                 compress=compress,
                                 block_loss=block_loss,

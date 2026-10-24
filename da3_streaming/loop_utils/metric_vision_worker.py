@@ -4,9 +4,21 @@ Line-delimited JSON control and numeric NPZ payloads; stdout is protocol-only.
 No downloads, dependency installation, ROS imports or database writes occur.
 """
 from __future__ import annotations
-import argparse, contextlib, hashlib, json, os, sys, time, traceback
+import argparse, contextlib, hashlib, json, os, sys, time, traceback, fcntl
 from pathlib import Path
 import numpy as np
+
+
+@contextlib.contextmanager
+def gpu_turn(path):
+    if not path:
+        yield 0.
+        return
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    with path.open('a') as handle:
+        start=time.monotonic();fcntl.flock(handle,fcntl.LOCK_EX)
+        try:yield time.monotonic()-start
+        finally:fcntl.flock(handle,fcntl.LOCK_UN)
 
 
 def sample(array, points):
@@ -138,16 +150,33 @@ def main():
                 start = time.monotonic()
                 torch.cuda.reset_peak_memory_stats()
                 if args.mode == 'streamer':
-                    streamer.process_chunk(request['image_paths'],
-                                           final=bool(request.get('final', False)),
-                                           observations_only=bool(
-                                               metric.get('inference_observations_only', False)))
+                    supplied_K = request.get('intrinsics')
+                    if supplied_K is not None:
+                        K = np.asarray(supplied_K, dtype=np.float64)
+                        if K.shape != (3, 3) or not np.isfinite(K).all() or K[0, 0] <= 0 or K[1, 1] <= 0:
+                            raise ValueError('Invalid measured camera intrinsics')
+                        streamer.intrinsics = K
+                    else:
+                        streamer.intrinsics = None
+                    with gpu_turn(metric.get('inference_gpu_lock')) as gpu_wait_seconds:
+                        streamer.process_chunk(request['image_paths'],
+                                               final=bool(request.get('final', False)),
+                                               observations_only=bool(
+                                                   metric.get('inference_observations_only', False)))
                     observation = streamer.metric_last_observation
                     pred = observation['predictions']
                     fields = [
                         'depth', 'conf', 'mask', 'extrinsics', 'intrinsics', 'processed_images'
                     ]
                     arrays = {key: np.asarray(getattr(pred, key)) for key in fields}
+                    if config['Weights']['model'] == 'MapAnything':
+                        from PIL import Image
+                        from mapanything.utils.cropping import crop_resize_if_necessary
+                        with Image.open(request['image_paths'][0]) as original:
+                            placeholder = Image.new('RGB', original.size)
+                        processed_size = (pred.depth.shape[2], pred.depth.shape[1])
+                        arrays['original_to_model'] = np.asarray(crop_resize_if_necessary(
+                            image=placeholder, resolution=processed_size, intrinsics=np.eye(3))[1])
                     if metric.get('inference_sparse_world_points', False):
                         # Exactly the consumer's 4-mod-8 pixel lattice. Preserve
                         # predicted values rather than re-lifting rounded depth.
@@ -156,7 +185,7 @@ def main():
                     else:
                         arrays['world_points'] = np.asarray(pred.world_points)
                     s, R, t = observation['visual_pose']
-                    details = dict(visual_pose=[float(s), R.tolist(),
+                    details = dict(gpu_wait_seconds=gpu_wait_seconds, calibration_input=supplied_K, calibration_conditioned=bool(supplied_K is not None and config['Weights']['model'] == 'MapAnything'), visual_pose=[float(s), R.tolist(),
                                                 t.tolist()],
                                    chunk_index=streamer.chunk_idx - 1,
                                    chunk_timings=streamer.last_chunk_timings)
